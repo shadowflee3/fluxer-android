@@ -7,6 +7,9 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
@@ -19,6 +22,9 @@ import androidx.core.app.NotificationCompat
  * A foreground service carries a visible notification and signals to the OS
  * that this process is doing user-requested work.
  *
+ * Also requests transient audio focus with ducking so background music
+ * lowers its volume during calls rather than competing at full volume.
+ *
  * Lifecycle:
  *   - Started in MainActivity.onStop()  (app fully backgrounded)
  *   - Stopped in MainActivity.onStart() (app comes back to foreground)
@@ -29,6 +35,9 @@ class FluxerForegroundService : Service() {
         private const val CHANNEL_ID = "fluxer_bg"
         private const val NOTIF_ID   = Int.MAX_VALUE // reserved; won't collide with chat notifs
     }
+
+    // Held while the service is running so music apps duck their volume
+    private var audioFocusRequest: AudioFocusRequest? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         createChannel()
@@ -67,6 +76,7 @@ class FluxerForegroundService : Service() {
             else -> startForeground(NOTIF_ID, notif)
         }
 
+        requestAudioFocus()
         return START_STICKY
     }
 
@@ -74,6 +84,7 @@ class FluxerForegroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        releaseAudioFocus()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
@@ -81,6 +92,51 @@ class FluxerForegroundService : Service() {
             stopForeground(true)
         }
     }
+
+    // ── Audio focus ───────────────────────────────────────────────────────────
+
+    /**
+     * Requests transient audio focus with ducking.
+     * Music apps will lower their volume while the call is active and restore
+     * it when the service is destroyed (call ended or app foregrounded).
+     */
+    private fun requestAudioFocus() {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
+                .setAcceptsDelayedFocusGain(false)
+                .setOnAudioFocusChangeListener { /* no-op: we always hold until destroyed */ }
+                .build()
+            am.requestAudioFocus(req)
+            audioFocusRequest = req
+        } else {
+            @Suppress("DEPRECATION")
+            am.requestAudioFocus(
+                null,
+                AudioManager.STREAM_VOICE_CALL,
+                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+            )
+        }
+    }
+
+    private fun releaseAudioFocus() {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioFocusRequest?.let { am.abandonAudioFocusRequest(it) }
+            audioFocusRequest = null
+        } else {
+            @Suppress("DEPRECATION")
+            am.abandonAudioFocus(null)
+        }
+    }
+
+    // ── Notification channel ──────────────────────────────────────────────────
 
     private fun createChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

@@ -8,6 +8,7 @@ import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 
 class SetupActivity : AppCompatActivity() {
@@ -40,6 +41,14 @@ class SetupActivity : AppCompatActivity() {
                 true
             } else false
         }
+
+        // Modern back navigation — set result CANCELED so MainActivity knows setup was dismissed
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                setResult(RESULT_CANCELED)
+                finish()
+            }
+        })
     }
 
     private fun attemptSave() {
@@ -76,11 +85,5 @@ class SetupActivity : AppCompatActivity() {
         }
     }
 
-    // Pressing back on first-run setup should cancel (MainActivity will finish)
-    @Deprecated("Compatibility with minSdk 23")
-    override fun onBackPressed() {
-        setResult(RESULT_CANCELED)
-        @Suppress("DEPRECATION")
-        super.onBackPressed()
-    }
 }
+

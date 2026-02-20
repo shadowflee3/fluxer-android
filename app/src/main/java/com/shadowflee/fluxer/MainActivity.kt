@@ -1,26 +1,41 @@
 package com.shadowflee.fluxer
 
 import android.Manifest
+import android.app.Activity
 import android.app.DownloadManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.PictureInPictureParams
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.media.AudioAttributes
 import android.media.RingtoneManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
+import android.net.http.SslError
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
+import android.util.Log
+import android.util.Rational
+import android.view.WindowManager
+import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
 import android.webkit.GeolocationPermissions
 import android.webkit.JavascriptInterface
 import android.webkit.MimeTypeMap
 import android.webkit.PermissionRequest
+import android.webkit.SslErrorHandler
 import android.webkit.URLUtil
+import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -28,11 +43,14 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import java.util.concurrent.atomic.AtomicLong
 
 class MainActivity : AppCompatActivity() {
@@ -43,7 +61,7 @@ class MainActivity : AppCompatActivity() {
     private var serverUrl: String = ""
 
     // ── WebView permission-request queue ──────────────────────────────────────
-    // Android shows one system permission dialog at a time.  WebChromeClient can
+    // Android shows one system permission dialog at a time. WebChromeClient can
     // receive a second PermissionRequest while the first dialog is still up.
     // We queue them and process sequentially so none are silently dropped.
     private val pendingWebPermissions = ArrayDeque<PermissionRequest>()
@@ -51,11 +69,9 @@ class MainActivity : AppCompatActivity() {
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { grants ->
-        // Process the head of the queue that triggered this dialog
         pendingWebPermissions.removeFirstOrNull()?.let { req ->
             grantOrDenyWebRequest(req, grants)
         }
-        // Trigger the next queued request (if any)
         processNextWebPermission()
     }
 
@@ -63,44 +79,279 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestPermission()
     ) { /* result ignored — we check permission at notification time */ }
 
+    // ── File upload chooser ───────────────────────────────────────────────────
+    private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
+
+    private val fileChooserLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val cb = fileChooserCallback ?: return@registerForActivityResult
+        fileChooserCallback = null
+        if (result.resultCode == Activity.RESULT_OK) {
+            val data = result.data
+            val uris: Array<Uri>? = when {
+                data?.clipData != null -> {
+                    val clip = data.clipData!!
+                    Array(clip.itemCount) { i -> clip.getItemAt(i).uri }
+                }
+                data?.data != null -> arrayOf(data.data!!)
+                else -> null
+            }
+            cb.onReceiveValue(uris)
+        } else {
+            cb.onReceiveValue(null)
+        }
+    }
+
+    // ── Network monitoring ────────────────────────────────────────────────────
+    private var connectivityCallback: ConnectivityManager.NetworkCallback? = null
+    private var wasOffline = false
+
+    // ── PiP / call state ──────────────────────────────────────────────────────
+    // "audio" or "video" while a call is active, null otherwise.
+    // Drives FLAG_KEEP_SCREEN_ON and automatic PiP entry on home press.
+    private var activeCallType: String? = null
+
+    // ── Pending share text ────────────────────────────────────────────────────
+    // Text shared from another app; injected into the web page after load.
+    private var pendingShareText: String? = null
+
     companion object {
-        const val PREFS_NAME = "fluxer_prefs"
-        const val KEY_SERVER_URL = "server_url"
+        const val PREFS_NAME       = "fluxer_prefs"
+        const val KEY_SERVER_URL   = "server_url"
         private const val NOTIF_CHANNEL_ID_DEFAULT = "fluxer"
-        private const val KEY_NOTIF_CHANNEL_ID = "notif_channel_id"
-        private const val KEY_NOTIF_SOUND_URI  = "notif_sound_uri"
-        private const val SETUP_REQUEST   = 1001
-        private const val RINGTONE_REQUEST = 1002
+        private const val KEY_NOTIF_SOUND_URI      = "notif_sound_uri"
+        private const val SETUP_REQUEST            = 1001
+        private const val RINGTONE_REQUEST         = 1002
+        private const val LOG_TAG                  = "FluxerWebView"
 
         // AtomicLong in companion object so it survives Activity recreation
-        // (config changes, back-stack restore) without ever resetting to 0
-        // and reusing a notification ID that may still be visible.
+        // (config changes, back-stack restore) without resetting to 0.
         private val notifIdCounter = AtomicLong(0)
     }
 
-    // Active notification channel ID. Derived from the selected sound so each
-    // unique sound gets its own channel (Android doesn't allow mutating a channel's
-    // sound after creation). Updated by createNotificationChannel().
-    // @Volatile because showNotification() runs on the JavascriptInterface thread
-    // while createNotificationChannel() runs on the main thread.
+    // Active notification channel ID — @Volatile because showNotification() runs
+    // on the JavascriptInterface thread while createNotificationChannel() runs on main.
     @Volatile
     private var activeNotifChannelId: String = NOTIF_CHANNEL_ID_DEFAULT
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // SplashScreen must be installed before super.onCreate() so the compat
+        // library can intercept the window and display the branded launch screen.
+        installSplashScreen()
         super.onCreate(savedInstanceState)
+
         serverUrl = loadServerUrl()
         if (serverUrl.isEmpty()) {
             openSetup()
             return
         }
+
         createNotificationChannel()
         setContentView(R.layout.activity_main)
         webView = findViewById(R.id.webView)
         configureWebView()
         requestNotificationPermissionIfNeeded()
-        webView.loadUrl(serverUrl)
+        registerNetworkCallback()
+
+        if (savedInstanceState != null) {
+            // Restore WebView scroll position and back-stack after config change (rotation, etc.)
+            webView.restoreState(savedInstanceState)
+        } else {
+            val handled = handleIncomingIntent(intent)
+            if (!handled) webView.loadUrl(serverUrl)
+        }
+
+        // Modern back navigation (replaces deprecated onBackPressed).
+        // Predictive back gesture on Android 13+ gets smooth preview animation.
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (::webView.isInitialized && webView.canGoBack()) {
+                    webView.goBack()
+                } else {
+                    isEnabled = false
+                    onBackPressedDispatcher.onBackPressed()
+                }
+            }
+        })
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        // Activity is singleTop: re-delivered when already on top of the stack
+        // (deep link tap, share from another app while Fluxer is visible).
+        if (::webView.isInitialized) handleIncomingIntent(intent)
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        // Persist WebView back-stack and scroll position across config changes.
+        if (::webView.isInitialized) webView.saveState(outState)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // webView.onPause() is intentionally NOT called — it would fire a
+        // visibilitychange → hidden event and suspend JavaScript timers, both
+        // of which terminate active voice/video calls.
+        // webView.onResume() IS called so the WebView's internal media capture
+        // stack returns to the active state when the app comes to the foreground.
+        // Without this, getUserMedia() (called on mic unmute) can fail silently
+        // after the Activity has been through a pause/resume cycle.
+        if (::webView.isInitialized) webView.onResume()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // Flush session cookies to disk so they survive process death.
+        CookieManager.getInstance().flush()
+        // webView.onPause() intentionally NOT called — see onResume() above.
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // App is visible again — dismiss the background notification.
+        stopService(Intent(this, FluxerForegroundService::class.java))
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // App fully backgrounded — start the foreground service so Android
+        // keeps this process alive and the user's call continues uninterrupted.
+        // Note: onStop() is NOT called when entering PiP (the activity stays
+        // visible), so the service is not started unnecessarily during PiP.
+        if (::webView.isInitialized) {
+            val svc = Intent(this, FluxerForegroundService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(svc)
+            } else {
+                startService(svc)
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        unregisterNetworkCallback()
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        // On severe memory pressure clear the in-memory WebView caches
+        // (keeps disk cache so the page can reload from cache after GC).
+        if (level >= TRIM_MEMORY_RUNNING_CRITICAL && ::webView.isInitialized) {
+            webView.clearCache(false)
+        }
+    }
+
+    // ── Picture-in-Picture ────────────────────────────────────────────────────
+
+    /**
+     * Called when the user presses Home (or switches apps) while a call is active.
+     * We automatically enter PiP so the call stays visible in a small overlay.
+     */
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && activeCallType != null) {
+            val params = PictureInPictureParams.Builder()
+                .setAspectRatio(Rational(16, 9))
+                .build()
+            try { enterPictureInPictureMode(params) } catch (_: Exception) {
+                // PiP not supported on this device/configuration — silently ignore
+            }
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        // Notify the web app so it can hide nav/toolbars in PiP and restore them on exit.
+        if (::webView.isInitialized) {
+            val flag = if (isInPictureInPictureMode) "true" else "false"
+            webView.evaluateJavascript(
+                "if (typeof window.__fluxerOnPipChanged === 'function') " +
+                "window.__fluxerOnPipChanged($flag);",
+                null
+            )
+        }
+    }
+
+    // ── Deep links & share intents ────────────────────────────────────────────
+
+    /**
+     * Inspects the incoming Intent and acts on deep links / share content.
+     * Returns true if the intent changed what's loaded in the WebView.
+     */
+    private fun handleIncomingIntent(intent: Intent?): Boolean {
+        if (intent == null) return false
+        return when (intent.action) {
+            Intent.ACTION_VIEW -> {
+                val uri = intent.data ?: return false
+                if (uri.scheme == "fluxer") {
+                    // Convert fluxer://channel/123 → serverUrl/#/channel/123
+                    val fragment = (uri.encodedPath ?: "").trimStart('/')
+                    webView.loadUrl("$serverUrl/#/$fragment")
+                    true
+                } else false
+            }
+            Intent.ACTION_SEND -> {
+                val text = intent.getStringExtra(Intent.EXTRA_TEXT) ?: return false
+                // Load the app (in case it's not loaded yet) then inject after page finishes.
+                pendingShareText = text
+                webView.loadUrl(serverUrl)
+                true
+            }
+            else -> false
+        }
+    }
+
+    // ── Network monitoring ────────────────────────────────────────────────────
+
+    private fun registerNetworkCallback() {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val req = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                if (wasOffline) {
+                    wasOffline = false
+                    runOnUiThread {
+                        if (::webView.isInitialized) {
+                            val url = webView.url ?: ""
+                            // Auto-reload if we're sitting on the error page
+                            if (url.contains("error.html") || url.isEmpty()) {
+                                webView.loadUrl(serverUrl)
+                            }
+                        }
+                    }
+                }
+            }
+            override fun onLost(network: Network) {
+                wasOffline = true
+                runOnUiThread {
+                    Toast.makeText(
+                        this@MainActivity, "Network connection lost", Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }
+        cm.registerNetworkCallback(req, cb)
+        connectivityCallback = cb
+    }
+
+    private fun unregisterNetworkCallback() {
+        val cb = connectivityCallback ?: return
+        connectivityCallback = null
+        try {
+            (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager)
+                .unregisterNetworkCallback(cb)
+        } catch (_: Exception) {}
     }
 
     // ── Server URL persistence ────────────────────────────────────────────────
@@ -116,27 +367,18 @@ class MainActivity : AppCompatActivity() {
         return try {
             val uri = Uri.parse(url)
             uri.scheme == "http" || uri.scheme == "https"
-        } catch (_: Exception) {
-            false
-        }
+        } catch (_: Exception) { false }
     }
 
     // ── Same-origin helper ────────────────────────────────────────────────────
 
-    // Returns the effective port for a URI, substituting scheme defaults.
     private fun effectivePort(uri: Uri): Int {
         val p = uri.port
         if (p != -1) return p
-        return when (uri.scheme) {
-            "https" -> 443
-            "http"  -> 80
-            else    -> -1
-        }
+        return when (uri.scheme) { "https" -> 443; "http" -> 80; else -> -1 }
     }
 
     private fun isSameOrigin(uri: Uri, reference: Uri): Boolean {
-        // Domain names are case-insensitive (RFC 3986 §6.2.2.1) — lowercase before comparing.
-        // Also guard against null hosts (e.g. malformed or non-hierarchical URIs).
         val uriHost = uri.host?.lowercase() ?: return false
         val refHost = reference.host?.lowercase() ?: return false
         return uri.scheme?.lowercase() == reference.scheme?.lowercase() &&
@@ -164,6 +406,8 @@ class MainActivity : AppCompatActivity() {
                 webView = findViewById(R.id.webView)
                 configureWebView()
                 requestNotificationPermissionIfNeeded()
+                unregisterNetworkCallback()
+                registerNetworkCallback()
                 webView.loadUrl(serverUrl)
             }
             RINGTONE_REQUEST -> {
@@ -175,21 +419,15 @@ class MainActivity : AppCompatActivity() {
                     data?.getParcelableExtra(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
                 }
                 saveNotificationSoundUri(pickedUri)
-                // Delete the old channel and recreate — Android won't let us change
-                // a channel's sound after creation.
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                     val oldId = activeNotifChannelId
-                    createNotificationChannel() // updates activeNotifChannelId
+                    createNotificationChannel()
                     if (oldId != activeNotifChannelId) nm.deleteNotificationChannel(oldId)
                 }
                 val label = if (pickedUri == null) "Silent" else {
                     val ringtone = RingtoneManager.getRingtone(this, pickedUri)
-                    try {
-                        ringtone?.getTitle(this) ?: "Custom"
-                    } finally {
-                        ringtone?.stop()
-                    }
+                    try { ringtone?.getTitle(this) ?: "Custom" } finally { ringtone?.stop() }
                 }
                 Toast.makeText(this, "Notification sound: $label", Toast.LENGTH_SHORT).show()
             }
@@ -199,12 +437,15 @@ class MainActivity : AppCompatActivity() {
     // ── WebView setup ─────────────────────────────────────────────────────────
 
     private fun configureWebView() {
+        // Enable remote debugging in debug builds so devs can inspect with chrome://inspect
+        if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true)
+
         with(webView.settings) {
             javaScriptEnabled = true
             domStorageEnabled = true
             databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
-            // Disallow file:// and content:// access — only remote content is loaded
+            // Disallow local file / content access — only remote content is loaded
             allowFileAccess = false
             allowContentAccess = false
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
@@ -212,6 +453,12 @@ class MainActivity : AppCompatActivity() {
             setSupportZoom(true)
             builtInZoomControls = true
             displayZoomControls = false
+            // Respect system text size preference (accessibility)
+            textZoom = (resources.configuration.fontScale * 100).toInt().coerceIn(50, 200)
+            // Safe Browsing warns users about phishing/malware URLs (Android 8.1+)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                safeBrowsingEnabled = true
+            }
         }
 
         webView.addJavascriptInterface(FluxerBridge(), "FluxerAndroid")
@@ -228,44 +475,30 @@ class MainActivity : AppCompatActivity() {
     private inner class FluxerChromeClient : WebChromeClient() {
 
         override fun onPermissionRequest(request: PermissionRequest) {
-            // Validate origin before touching any resource — a cross-origin redirect
-            // or iframe must not receive camera/microphone grants.
             val requestUri = request.origin ?: Uri.EMPTY
-            val serverUri = Uri.parse(serverUrl)
-            if (!isSameOrigin(requestUri, serverUri)) {
-                request.deny()
-                return
-            }
+            val serverUri  = Uri.parse(serverUrl)
+            if (!isSameOrigin(requestUri, serverUri)) { request.deny(); return }
 
-            // Filter to only the resource types we support
             val supportedResources = request.resources.filter { resource ->
                 resource == PermissionRequest.RESOURCE_AUDIO_CAPTURE ||
                 resource == PermissionRequest.RESOURCE_VIDEO_CAPTURE
             }
-            if (supportedResources.isEmpty()) {
-                request.deny()
-                return
-            }
+            if (supportedResources.isEmpty()) { request.deny(); return }
 
             val neededAndroidPerms = supportedResources.flatMap { resource ->
                 when (resource) {
-                    PermissionRequest.RESOURCE_AUDIO_CAPTURE ->
-                        listOf(Manifest.permission.RECORD_AUDIO)
-                    PermissionRequest.RESOURCE_VIDEO_CAPTURE ->
-                        listOf(Manifest.permission.CAMERA)
+                    PermissionRequest.RESOURCE_AUDIO_CAPTURE -> listOf(Manifest.permission.RECORD_AUDIO)
+                    PermissionRequest.RESOURCE_VIDEO_CAPTURE -> listOf(Manifest.permission.CAMERA)
                     else -> emptyList()
                 }
             }.filter { perm ->
                 ContextCompat.checkSelfPermission(this@MainActivity, perm) !=
-                        PackageManager.PERMISSION_GRANTED
+                    PackageManager.PERMISSION_GRANTED
             }
 
             if (neededAndroidPerms.isEmpty()) {
-                // Already granted — approve immediately
                 request.grant(supportedResources.toTypedArray())
             } else {
-                // Queue and process sequentially — only launch the dialog if
-                // no other request is already in progress (queue was empty).
                 val wasEmpty = pendingWebPermissions.isEmpty()
                 pendingWebPermissions.addLast(request)
                 if (wasEmpty) permissionLauncher.launch(neededAndroidPerms.toTypedArray())
@@ -276,12 +509,57 @@ class MainActivity : AppCompatActivity() {
             origin: String,
             callback: GeolocationPermissions.Callback
         ) {
-            callback.invoke(origin, false, false) // Deny geolocation
+            callback.invoke(origin, false, false)
+        }
+
+        // ── File upload (camera, gallery, documents) ──────────────────────────
+        override fun onShowFileChooser(
+            webView: WebView,
+            filePathCallback: ValueCallback<Array<Uri>>,
+            fileChooserParams: FileChooserParams
+        ): Boolean {
+            // Cancel any stale callback that never got a result (safety)
+            fileChooserCallback?.onReceiveValue(null)
+            fileChooserCallback = filePathCallback
+
+            val acceptTypes = fileChooserParams.acceptTypes
+                .filter { it.isNotBlank() }
+                .joinToString(",")
+                .ifBlank { "*/*" }
+
+            // Use ACTION_GET_CONTENT for broad compatibility across all launchers
+            val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                // If multiple types, collapse to */* — the OS file picker filters by extension
+                type = if (acceptTypes.contains(",")) "*/*" else acceptTypes
+                if (fileChooserParams.mode == FileChooserParams.MODE_OPEN_MULTIPLE) {
+                    putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                }
+            }
+            return try {
+                fileChooserLauncher.launch(intent)
+                true
+            } catch (_: ActivityNotFoundException) {
+                fileChooserCallback = null
+                filePathCallback.onReceiveValue(null)
+                false
+            }
+        }
+
+        // ── JS console → Logcat (debug builds only) ───────────────────────────
+        override fun onConsoleMessage(message: ConsoleMessage): Boolean {
+            if (BuildConfig.DEBUG) {
+                val text = "${message.message()} [${message.sourceId()}:${message.lineNumber()}]"
+                when (message.messageLevel()) {
+                    ConsoleMessage.MessageLevel.ERROR   -> Log.e(LOG_TAG, text)
+                    ConsoleMessage.MessageLevel.WARNING -> Log.w(LOG_TAG, text)
+                    else                               -> Log.d(LOG_TAG, text)
+                }
+            }
+            return true
         }
     }
 
-    // grants == null means "all system permissions were already held" — grant everything.
-    // grants != null means a launcher result came back; filter by what was actually granted.
     private fun grantOrDenyWebRequest(req: PermissionRequest, grants: Map<String, Boolean>?) {
         val grantableResources = req.resources.filter { resource ->
             when (resource) {
@@ -296,28 +574,20 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun processNextWebPermission() {
-        // Use a loop instead of recursion to avoid stack overflow when many
-        // already-granted permission requests are queued back-to-back.
         while (pendingWebPermissions.isNotEmpty()) {
             val next = pendingWebPermissions.first()
             val neededPerms = next.resources.flatMap { resource ->
                 when (resource) {
-                    PermissionRequest.RESOURCE_AUDIO_CAPTURE ->
-                        listOf(Manifest.permission.RECORD_AUDIO)
-                    PermissionRequest.RESOURCE_VIDEO_CAPTURE ->
-                        listOf(Manifest.permission.CAMERA)
+                    PermissionRequest.RESOURCE_AUDIO_CAPTURE -> listOf(Manifest.permission.RECORD_AUDIO)
+                    PermissionRequest.RESOURCE_VIDEO_CAPTURE -> listOf(Manifest.permission.CAMERA)
                     else -> emptyList()
                 }
             }.filter { perm ->
                 ContextCompat.checkSelfPermission(this, perm) != PackageManager.PERMISSION_GRANTED
             }
             if (neededPerms.isEmpty()) {
-                // All needed permissions already granted — pass null so the helper grants all
-                pendingWebPermissions.removeFirst().let { req ->
-                    grantOrDenyWebRequest(req, null)
-                }
+                pendingWebPermissions.removeFirst().let { req -> grantOrDenyWebRequest(req, null) }
             } else {
-                // Need to show a dialog — launcher result will call us again when done
                 permissionLauncher.launch(neededPerms.toTypedArray())
                 return
             }
@@ -330,24 +600,32 @@ class MainActivity : AppCompatActivity() {
 
         override fun onPageFinished(view: WebView, url: String) {
             super.onPageFinished(view, url)
-            // Guard: only inject the bridge flag when we are on the app's own origin.
-            // HTTP redirects bypass shouldOverrideUrlLoading, so we must check here
-            // to prevent an attacker-controlled redirect from accessing the bridge.
             val loadedUri = Uri.parse(url)
             val serverUri = Uri.parse(serverUrl)
             if (isSameOrigin(loadedUri, serverUri) || url.startsWith("file:///android_asset/")) {
-                // Inject the bridge flag for both same-origin app pages and the bundled error
-                // page — the error page's "Change Server" button needs FluxerAndroid.openChangeServer().
                 view.evaluateJavascript("window.__fluxerAndroid = true;", null)
+
+                // Inject any text that was shared from another app while the page was loading
+                pendingShareText?.let { text ->
+                    pendingShareText = null
+                    // JSON-encode to safely handle quotes, newlines, backslashes
+                    val escaped = text
+                        .replace("\\", "\\\\")
+                        .replace("'", "\\'")
+                        .replace("\n", "\\n")
+                        .replace("\r", "")
+                        .take(4096) // sanity cap
+                    view.evaluateJavascript(
+                        "if (typeof window.__fluxerReceiveShare === 'function')" +
+                        "{ window.__fluxerReceiveShare('$escaped'); }",
+                        null
+                    )
+                }
             } else if (!url.startsWith("about:")) {
-                // HTTP redirect landed us outside our origin.
-                // Try to open the destination in the system browser, then show the error page.
                 val scheme = loadedUri.scheme
                 if (scheme == "http" || scheme == "https") {
                     try { startActivity(Intent(Intent.ACTION_VIEW, loadedUri)) } catch (_: Exception) {}
                 }
-                // Always show the error page regardless of whether the browser launched —
-                // the WebView should not remain on a cross-origin page.
                 view.loadUrl("file:///android_asset/error.html")
             }
         }
@@ -362,6 +640,34 @@ class MainActivity : AppCompatActivity() {
             view.loadUrl("file:///android_asset/error.html")
         }
 
+        /**
+         * Handle SSL errors — for self-hosted servers that use self-signed certificates,
+         * offer the user a one-time "Continue anyway?" prompt.
+         * For any other host the error is silently cancelled (secure-by-default).
+         */
+        override fun onReceivedSslError(
+            view: WebView,
+            handler: SslErrorHandler,
+            error: SslError
+        ) {
+            val serverHost = Uri.parse(serverUrl).host ?: run { handler.cancel(); return }
+            val errorUrl   = error.url ?: ""
+            // Proceed only when the error is on the configured server's host
+            if (errorUrl.contains(serverHost)) {
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Untrusted Certificate")
+                    .setMessage(
+                        "The server \"$serverHost\" has an untrusted SSL certificate.\n\n" +
+                        "This is normal for self-signed certificates on private servers. Continue?"
+                    )
+                    .setPositiveButton("Continue") { _, _ -> handler.proceed() }
+                    .setNegativeButton("Cancel")   { _, _ -> handler.cancel() }
+                    .show()
+            } else {
+                handler.cancel()
+            }
+        }
+
         override fun shouldOverrideUrlLoading(
             view: WebView,
             request: WebResourceRequest
@@ -371,22 +677,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Returns true if the URL was handled externally (WebView should not navigate)
     private fun handleNavigation(uri: Uri): Boolean {
         return try {
             val serverUri = Uri.parse(serverUrl)
             if (isSameOrigin(uri, serverUri)) {
-                false // Let WebView handle same-origin navigation
+                false
             } else {
                 val scheme = uri.scheme
                 if (scheme == "http" || scheme == "https" || scheme == "mailto") {
                     startActivity(Intent(Intent.ACTION_VIEW, uri))
                 }
-                true // Block WebView from navigating away
+                true
             }
-        } catch (_: Exception) {
-            true // Block anything that fails to parse
-        }
+        } catch (_: Exception) { true }
     }
 
     // ── File downloads ────────────────────────────────────────────────────────
@@ -397,8 +700,6 @@ class MainActivity : AppCompatActivity() {
         contentDisposition: String,
         mimeType: String
     ) {
-        // On Android 9 and below, WRITE_EXTERNAL_STORAGE is required at runtime.
-        // On Android 10+ the permission is not needed for public Downloads.
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
             != PackageManager.PERMISSION_GRANTED
@@ -408,12 +709,11 @@ class MainActivity : AppCompatActivity() {
         }
         try {
             val parsedUri = Uri.parse(url)
-            // Only allow http/https — block blob:, data:, file:, javascript:, etc.
             val scheme = parsedUri.scheme
             if (scheme != "http" && scheme != "https") return
 
             val filename = URLUtil.guessFileName(url, contentDisposition, mimeType)
-                .replace(Regex("[/\\\\]"), "_")  // strip any path separators from the name
+                .replace(Regex("[/\\\\]"), "_")
                 .take(255)
                 .ifBlank { "download" }
             val safeMime = MimeTypeMap.getSingleton()
@@ -430,18 +730,14 @@ class MainActivity : AppCompatActivity() {
                 )
                 setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename)
             }
-            val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-            dm.enqueue(req)
+            (getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(req)
             Toast.makeText(this, "Downloading $filename…", Toast.LENGTH_SHORT).show()
         } catch (_: Exception) {
-            // Do not expose exception details — they may contain internal paths or URLs
             Toast.makeText(this, "Download failed.", Toast.LENGTH_SHORT).show()
         }
     }
 
     // ── Notifications ─────────────────────────────────────────────────────────
-
-    // ── Notification sound persistence ────────────────────────────────────────
 
     private fun loadNotificationSoundUri(): Uri? {
         val raw = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -455,7 +751,6 @@ class MainActivity : AppCompatActivity() {
             .apply()
     }
 
-    // Opens the system ringtone picker. Result is handled in onActivityResult.
     private fun openRingtonePicker() {
         val currentUri = loadNotificationSoundUri()
         val intent = Intent(RingtoneManager.ACTION_RINGTONE_PICKER).apply {
@@ -469,30 +764,19 @@ class MainActivity : AppCompatActivity() {
         startActivityForResult(intent, RINGTONE_REQUEST)
     }
 
-    // ── Notification channel ─────────────────────────────────────────────────
-
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             val soundUri = loadNotificationSoundUri()
-
-            // Encode the chosen sound into the channel ID so each unique sound
-            // gets its own channel (Android bars post-creation sound changes).
             val newChannelId = if (soundUri != null) {
                 "fluxer_${soundUri.toString().hashCode().and(0x7FFFFFFF)}"
             } else {
                 NOTIF_CHANNEL_ID_DEFAULT
             }
-
-            // Channel already exists — no action needed.
-            // Set activeNotifChannelId after confirming the channel is ready so
-            // showNotification() (running on the JavascriptInterface thread) never
-            // sees an ID for a channel that hasn't been created yet.
             if (nm.getNotificationChannel(newChannelId) != null) {
                 activeNotifChannelId = newChannelId
                 return
             }
-
             val channel = NotificationChannel(
                 newChannelId, "Fluxer", NotificationManager.IMPORTANCE_DEFAULT
             ).apply {
@@ -535,10 +819,6 @@ class MainActivity : AppCompatActivity() {
 
             val safeTitle = title.take(256)
             val safeBody  = body.take(1024)
-
-            // Compute the notification ID first so it can be used as the PendingIntent
-            // request code — using 0 for all notifications causes cache collisions on
-            // Android 12+ where PendingIntents with the same request code are merged.
             val id = (notifIdCounter.incrementAndGet() and 0x7FFFFFFF).toInt()
             val intent = Intent(this@MainActivity, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -556,11 +836,10 @@ class MainActivity : AppCompatActivity() {
                 .setContentIntent(pi)
                 .setAutoCancel(true)
                 .build()
-
             try {
                 NotificationManagerCompat.from(this@MainActivity).notify(id, notif)
             } catch (_: SecurityException) {
-                // Permission revoked between the check above and notify()
+                // Permission revoked between check and notify()
             }
         }
 
@@ -568,14 +847,11 @@ class MainActivity : AppCompatActivity() {
         fun getServerUrl(): String = serverUrl
 
         @JavascriptInterface
-        fun openChangeServer() {
-            runOnUiThread { openSetup() }
-        }
+        fun openChangeServer() { runOnUiThread { openSetup() } }
 
         /**
-         * Opens the system notification channel settings so the user can change
-         * sound, vibration, and importance directly. On Android 7 and below (where
-         * channels don't exist), falls back to our custom ringtone picker.
+         * Opens system notification channel settings so the user can change
+         * sound/vibration/importance directly. Falls back to ringtone picker on < API 26.
          */
         @JavascriptInterface
         fun openNotificationSettings() {
@@ -594,62 +870,41 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        /** Opens the ringtone picker directly so the user can set a custom sound. */
+        /** Opens the ringtone picker so the user can set a custom notification sound. */
         @JavascriptInterface
-        fun openCustomSoundPicker() {
-            runOnUiThread { openRingtonePicker() }
-        }
-    }
+        fun openCustomSoundPicker() { runOnUiThread { openRingtonePicker() } }
 
-    // ── Lifecycle / background keep-alive ────────────────────────────────────
-
-    override fun onResume() {
-        super.onResume()
-        // webView.onPause() is intentionally NOT called — it would fire a
-        // visibilitychange → hidden event and suspend JavaScript timers, both
-        // of which terminate active voice/video calls.
-        // webView.onResume() IS called so the WebView's internal media capture
-        // stack returns to the active state when the app comes to the foreground.
-        // Without this, getUserMedia() (called on mic unmute) can fail silently
-        // after the Activity has been through a pause/resume cycle.
-        // When the WebView was already fully active, this call is a no-op.
-        if (::webView.isInitialized) webView.onResume()
-    }
-
-    override fun onPause() {
-        super.onPause()
-        // webView.onPause() intentionally NOT called — see onResume() above.
-    }
-
-    override fun onStart() {
-        super.onStart()
-        // App is visible again — dismiss the background notification.
-        stopService(Intent(this, FluxerForegroundService::class.java))
-    }
-
-    override fun onStop() {
-        super.onStop()
-        // App fully backgrounded — start the foreground service so Android
-        // keeps this process alive and the user's call continues uninterrupted.
-        if (::webView.isInitialized) {
-            val svc = Intent(this, FluxerForegroundService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(svc)
-            } else {
-                startService(svc)
+        /**
+         * Called by the web app when the user joins a call.
+         * @param type "audio" or "video"
+         *
+         * Effect: keeps the screen on and enables automatic PiP on home-press.
+         */
+        @JavascriptInterface
+        fun startCall(type: String) {
+            runOnUiThread {
+                activeCallType = if (type == "video" || type == "audio") type else "audio"
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             }
         }
-    }
 
-    // ── Back navigation ───────────────────────────────────────────────────────
-
-    @Deprecated("Compatibility with minSdk 23")
-    override fun onBackPressed() {
-        if (::webView.isInitialized && webView.canGoBack()) {
-            webView.goBack()
-        } else {
-            @Suppress("DEPRECATION")
-            super.onBackPressed()
+        /**
+         * Called by the web app when the user leaves a call.
+         * Clears FLAG_KEEP_SCREEN_ON and disables automatic PiP.
+         */
+        @JavascriptInterface
+        fun endCall() {
+            runOnUiThread {
+                activeCallType = null
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
         }
+
+        /**
+         * Returns "audio", "video", or "" (empty string = not in a call).
+         * The web app can call this after a page reload to restore call UI state.
+         */
+        @JavascriptInterface
+        fun getCallState(): String = activeCallType ?: ""
     }
 }

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 12+ data extraction rules.
+  Using <include> without <exclude> means ONLY the listed files are backed up.
+  WebView caches and databases are implicitly excluded.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <include domain="sharedpref" path="fluxer_prefs.xml"/>
+    </cloud-backup>
+    <device-transfer>
+        <include domain="sharedpref" path="fluxer_prefs.xml"/>
+    </device-transfer>
+</data-extraction-rules>

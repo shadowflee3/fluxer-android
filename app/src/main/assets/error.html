@@ -21,23 +21,23 @@
   }
   h1 { color: #e06c75; margin-bottom: 8px; font-size: 22px; }
   p { font-size: 14px; opacity: 0.7; max-width: 320px; }
-  button {
-    margin-top: 24px;
+  .btn {
+    margin-top: 16px;
     padding: 12px 28px;
-    background: #7c3aed;
-    color: #fff;
     border: none;
     border-radius: 8px;
     font-size: 15px;
     cursor: pointer;
+    width: 200px;
   }
+  .btn-primary  { background: #7c3aed; color: #fff; }
+  .btn-secondary { background: #2a2a4e; color: #ccc; margin-top: 10px; }
 </style>
 </head>
 <body>
   <h1>Connection Failed</h1>
   <p>Unable to reach the Fluxer server. Check that your server is online and your device has internet access.</p>
-  <button onclick="history.back()">Retry</button>
-  <br>
-  <button style="margin-top:12px;background:#333" onclick="window.FluxerAndroid && FluxerAndroid.openChangeServer()">Change Server</button>
+  <button class="btn btn-primary" onclick="location.reload()">Retry</button>
+  <button class="btn btn-secondary" onclick="window.FluxerAndroid && FluxerAndroid.openChangeServer()">Change Server</button>
 </body>
 </html>

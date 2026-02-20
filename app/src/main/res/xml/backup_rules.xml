@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Pre-Android-12 backup rules (android:fullBackupContent).
+  Only the user preferences file is backed up; WebView data is left to default.
+-->
+<full-backup-content>
+    <include domain="sharedpref" path="fluxer_prefs.xml"/>
+</full-backup-content>
