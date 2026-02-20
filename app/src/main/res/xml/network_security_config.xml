@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Allow cleartext (HTTP) traffic so users can connect to self-hosted LAN servers
+  that don't have TLS. HTTPS servers are always allowed regardless of this config.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
