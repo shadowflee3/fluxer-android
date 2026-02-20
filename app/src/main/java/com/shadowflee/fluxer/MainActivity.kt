@@ -38,10 +38,6 @@ class MainActivity : AppCompatActivity() {
     // Set once from SharedPreferences, mutated only on the main thread.
     private var serverUrl: String = ""
 
-    // AtomicLong prevents overflow (Int.MAX_VALUE ~= 2 billion; Long can safely
-    // accumulate a lifetime of notifications without wrapping to negative IDs).
-    private val notifIdCounter = AtomicLong(0)
-
     // ── WebView permission-request queue ──────────────────────────────────────
     // Android shows one system permission dialog at a time.  WebChromeClient can
     // receive a second PermissionRequest while the first dialog is still up.
@@ -68,6 +64,11 @@ class MainActivity : AppCompatActivity() {
         const val KEY_SERVER_URL = "server_url"
         private const val NOTIF_CHANNEL_ID = "fluxer"
         private const val SETUP_REQUEST = 1001
+
+        // AtomicLong in companion object so it survives Activity recreation
+        // (config changes, back-stack restore) without ever resetting to 0
+        // and reusing a notification ID that may still be visible.
+        private val notifIdCounter = AtomicLong(0)
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -462,6 +463,42 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun openChangeServer() {
             runOnUiThread { openSetup() }
+        }
+    }
+
+    // ── Lifecycle / background keep-alive ────────────────────────────────────
+
+    override fun onResume() {
+        super.onResume()
+        // webView.onPause() / onResume() intentionally NOT called.
+        // Calling onPause() suspends JavaScript timers and dispatches a
+        // visibilitychange event to the page — both can terminate an active
+        // voice/video call.  The foreground service (below) keeps the process
+        // alive instead; the WebView continues running uninterrupted.
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // See comment in onResume(). No WebView pause here.
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // App is visible again — dismiss the background notification.
+        stopService(Intent(this, FluxerForegroundService::class.java))
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // App fully backgrounded — start the foreground service so Android
+        // keeps this process alive and the user's call continues uninterrupted.
+        if (::webView.isInitialized) {
+            val svc = Intent(this, FluxerForegroundService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(svc)
+            } else {
+                startService(svc)
+            }
         }
     }
 

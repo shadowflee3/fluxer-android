@@ -17,10 +17,15 @@ android {
 
     signingConfigs {
         release {
-            storeFile file('../keystore.jks')
-            storePassword 'fluxer2024'
-            keyAlias 'fluxer'
-            keyPassword 'fluxer2024'
+            def keystorePropsFile = rootProject.file('keystore.properties')
+            if (keystorePropsFile.exists()) {
+                def keystoreProps = new Properties()
+                keystorePropsFile.withInputStream { stream -> keystoreProps.load(stream) }
+                storeFile file(keystoreProps['storeFile'])
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+            }
         }
     }
 

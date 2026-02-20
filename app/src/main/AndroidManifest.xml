@@ -9,6 +9,11 @@
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
+    <!-- Foreground service keeps the process alive during background calls -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- API 34+: declare specific types used by the foreground service -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
@@ -37,6 +42,12 @@
             android:name=".SetupActivity"
             android:exported="false"
             android:windowSoftInputMode="adjustResize" />
+
+        <!-- Background keep-alive service for active calls -->
+        <service
+            android:name=".FluxerForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback|microphone" />
 
         <!-- FileProvider for sharing downloaded files -->
         <provider
