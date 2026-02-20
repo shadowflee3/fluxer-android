@@ -15,10 +15,20 @@ android {
         versionName "1.0.2"
     }
 
+    signingConfigs {
+        release {
+            storeFile file('../keystore.jks')
+            storePassword 'fluxer2024'
+            keyAlias 'fluxer'
+            keyPassword 'fluxer2024'
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig signingConfigs.release
         }
         debug {
             applicationIdSuffix ".debug"

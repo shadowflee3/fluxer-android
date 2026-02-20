@@ -183,7 +183,7 @@ class MainActivity : AppCompatActivity() {
         override fun onPermissionRequest(request: PermissionRequest) {
             // Validate origin before touching any resource — a cross-origin redirect
             // or iframe must not receive camera/microphone grants.
-            val requestUri = Uri.parse(request.origin ?: "")
+            val requestUri = request.origin ?: Uri.EMPTY
             val serverUri = Uri.parse(serverUrl)
             if (!isSameOrigin(requestUri, serverUri)) {
                 request.deny()
