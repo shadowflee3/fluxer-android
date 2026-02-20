@@ -5,13 +5,17 @@ import android.app.DownloadManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.media.RingtoneManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.provider.Settings
 import android.webkit.GeolocationPermissions
 import android.webkit.JavascriptInterface
 import android.webkit.MimeTypeMap
@@ -62,14 +66,25 @@ class MainActivity : AppCompatActivity() {
     companion object {
         const val PREFS_NAME = "fluxer_prefs"
         const val KEY_SERVER_URL = "server_url"
-        private const val NOTIF_CHANNEL_ID = "fluxer"
-        private const val SETUP_REQUEST = 1001
+        private const val NOTIF_CHANNEL_ID_DEFAULT = "fluxer"
+        private const val KEY_NOTIF_CHANNEL_ID = "notif_channel_id"
+        private const val KEY_NOTIF_SOUND_URI  = "notif_sound_uri"
+        private const val SETUP_REQUEST   = 1001
+        private const val RINGTONE_REQUEST = 1002
 
         // AtomicLong in companion object so it survives Activity recreation
         // (config changes, back-stack restore) without ever resetting to 0
         // and reusing a notification ID that may still be visible.
         private val notifIdCounter = AtomicLong(0)
     }
+
+    // Active notification channel ID. Derived from the selected sound so each
+    // unique sound gets its own channel (Android doesn't allow mutating a channel's
+    // sound after creation). Updated by createNotificationChannel().
+    // @Volatile because showNotification() runs on the JavascriptInterface thread
+    // while createNotificationChannel() runs on the main thread.
+    @Volatile
+    private var activeNotifChannelId: String = NOTIF_CHANNEL_ID_DEFAULT
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -137,17 +152,48 @@ class MainActivity : AppCompatActivity() {
 
     @Deprecated("Using onActivityResult for minSdk 23 compatibility")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != SETUP_REQUEST) return
-        if (resultCode != RESULT_OK) { finish(); return }
-        serverUrl = loadServerUrl()
-        if (serverUrl.isEmpty()) { finish(); return }
-        createNotificationChannel()
-        setContentView(R.layout.activity_main)
-        webView = findViewById(R.id.webView)
-        configureWebView()
-        requestNotificationPermissionIfNeeded()
-        webView.loadUrl(serverUrl)
+        when (requestCode) {
+            SETUP_REQUEST -> {
+                if (resultCode != RESULT_OK) { finish(); return }
+                serverUrl = loadServerUrl()
+                if (serverUrl.isEmpty()) { finish(); return }
+                createNotificationChannel()
+                setContentView(R.layout.activity_main)
+                webView = findViewById(R.id.webView)
+                configureWebView()
+                requestNotificationPermissionIfNeeded()
+                webView.loadUrl(serverUrl)
+            }
+            RINGTONE_REQUEST -> {
+                if (resultCode != RESULT_OK) return
+                val pickedUri: Uri? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    data?.getParcelableExtra(RingtoneManager.EXTRA_RINGTONE_PICKED_URI, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    data?.getParcelableExtra(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
+                }
+                saveNotificationSoundUri(pickedUri)
+                // Delete the old channel and recreate — Android won't let us change
+                // a channel's sound after creation.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    val oldId = activeNotifChannelId
+                    createNotificationChannel() // updates activeNotifChannelId
+                    if (oldId != activeNotifChannelId) nm.deleteNotificationChannel(oldId)
+                }
+                val label = if (pickedUri == null) "Silent" else {
+                    val ringtone = RingtoneManager.getRingtone(this, pickedUri)
+                    try {
+                        ringtone?.getTitle(this) ?: "Custom"
+                    } finally {
+                        ringtone?.stop()
+                    }
+                }
+                Toast.makeText(this, "Notification sound: $label", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     // ── WebView setup ─────────────────────────────────────────────────────────
@@ -395,13 +441,74 @@ class MainActivity : AppCompatActivity() {
 
     // ── Notifications ─────────────────────────────────────────────────────────
 
+    // ── Notification sound persistence ────────────────────────────────────────
+
+    private fun loadNotificationSoundUri(): Uri? {
+        val raw = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(KEY_NOTIF_SOUND_URI, null) ?: return null
+        return try { Uri.parse(raw) } catch (_: Exception) { null }
+    }
+
+    private fun saveNotificationSoundUri(uri: Uri?) {
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putString(KEY_NOTIF_SOUND_URI, uri?.toString())
+            .apply()
+    }
+
+    // Opens the system ringtone picker. Result is handled in onActivityResult.
+    private fun openRingtonePicker() {
+        val currentUri = loadNotificationSoundUri()
+        val intent = Intent(RingtoneManager.ACTION_RINGTONE_PICKER).apply {
+            putExtra(RingtoneManager.EXTRA_RINGTONE_TYPE, RingtoneManager.TYPE_NOTIFICATION)
+            putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_DEFAULT, true)
+            putExtra(RingtoneManager.EXTRA_RINGTONE_SHOW_SILENT, true)
+            putExtra(RingtoneManager.EXTRA_RINGTONE_TITLE, "Notification Sound")
+            if (currentUri != null) putExtra(RingtoneManager.EXTRA_RINGTONE_EXISTING_URI, currentUri)
+        }
+        @Suppress("DEPRECATION")
+        startActivityForResult(intent, RINGTONE_REQUEST)
+    }
+
+    // ── Notification channel ─────────────────────────────────────────────────
+
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val soundUri = loadNotificationSoundUri()
+
+            // Encode the chosen sound into the channel ID so each unique sound
+            // gets its own channel (Android bars post-creation sound changes).
+            val newChannelId = if (soundUri != null) {
+                "fluxer_${soundUri.toString().hashCode().and(0x7FFFFFFF)}"
+            } else {
+                NOTIF_CHANNEL_ID_DEFAULT
+            }
+
+            // Channel already exists — no action needed.
+            // Set activeNotifChannelId after confirming the channel is ready so
+            // showNotification() (running on the JavascriptInterface thread) never
+            // sees an ID for a channel that hasn't been created yet.
+            if (nm.getNotificationChannel(newChannelId) != null) {
+                activeNotifChannelId = newChannelId
+                return
+            }
+
             val channel = NotificationChannel(
-                NOTIF_CHANNEL_ID, "Fluxer", NotificationManager.IMPORTANCE_DEFAULT
-            ).apply { description = "Messages and alerts from Fluxer" }
-            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-                .createNotificationChannel(channel)
+                newChannelId, "Fluxer", NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = "Messages and alerts from Fluxer"
+                if (soundUri != null) {
+                    val audioAttrs = AudioAttributes.Builder()
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                        .build()
+                    setSound(soundUri, audioAttrs)
+                }
+            }
+            nm.createNotificationChannel(channel)
+            activeNotifChannelId = newChannelId
+        } else {
+            activeNotifChannelId = NOTIF_CHANNEL_ID_DEFAULT
         }
     }
 
@@ -440,7 +547,7 @@ class MainActivity : AppCompatActivity() {
                 this@MainActivity, id, intent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
-            val notif = NotificationCompat.Builder(this@MainActivity, NOTIF_CHANNEL_ID)
+            val notif = NotificationCompat.Builder(this@MainActivity, activeNotifChannelId)
                 .setSmallIcon(R.drawable.ic_notification)
                 .setContentTitle(safeTitle)
                 .setContentText(safeBody)
@@ -463,6 +570,34 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun openChangeServer() {
             runOnUiThread { openSetup() }
+        }
+
+        /**
+         * Opens the system notification channel settings so the user can change
+         * sound, vibration, and importance directly. On Android 7 and below (where
+         * channels don't exist), falls back to our custom ringtone picker.
+         */
+        @JavascriptInterface
+        fun openNotificationSettings() {
+            runOnUiThread {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    val intent = Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).apply {
+                        putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                        putExtra(Settings.EXTRA_CHANNEL_ID, activeNotifChannelId)
+                    }
+                    try { startActivity(intent) } catch (_: ActivityNotFoundException) {
+                        openRingtonePicker()
+                    }
+                } else {
+                    openRingtonePicker()
+                }
+            }
+        }
+
+        /** Opens the ringtone picker directly so the user can set a custom sound. */
+        @JavascriptInterface
+        fun openCustomSoundPicker() {
+            runOnUiThread { openRingtonePicker() }
         }
     }
 
