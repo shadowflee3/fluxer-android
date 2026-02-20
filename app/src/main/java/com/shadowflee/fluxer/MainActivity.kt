@@ -605,16 +605,20 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        // webView.onPause() / onResume() intentionally NOT called.
-        // Calling onPause() suspends JavaScript timers and dispatches a
-        // visibilitychange event to the page — both can terminate an active
-        // voice/video call.  The foreground service (below) keeps the process
-        // alive instead; the WebView continues running uninterrupted.
+        // webView.onPause() is intentionally NOT called — it would fire a
+        // visibilitychange → hidden event and suspend JavaScript timers, both
+        // of which terminate active voice/video calls.
+        // webView.onResume() IS called so the WebView's internal media capture
+        // stack returns to the active state when the app comes to the foreground.
+        // Without this, getUserMedia() (called on mic unmute) can fail silently
+        // after the Activity has been through a pause/resume cycle.
+        // When the WebView was already fully active, this call is a no-op.
+        if (::webView.isInitialized) webView.onResume()
     }
 
     override fun onPause() {
         super.onPause()
-        // See comment in onResume(). No WebView pause here.
+        // webView.onPause() intentionally NOT called — see onResume() above.
     }
 
     override fun onStart() {
